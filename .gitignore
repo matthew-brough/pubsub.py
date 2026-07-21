@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# CCE (code-context-engine)
+# CCE local cache (per-machine, not for version control)
+/.*/
+.mcp.json
+AGENTS.md
+CLAUDE.md
+
+# CCE (code-context-engine)
+# CCE local cache (per-machine, not for version control)
+.cce/
+# Claude Code local settings written by cce init
+.claude/settings.local.json
