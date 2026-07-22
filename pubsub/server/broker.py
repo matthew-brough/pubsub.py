@@ -67,6 +67,12 @@ class Broker:
         self._retry = RetryEngine(durability, self._policy, self._clock)
         self._obs = observer or Observer()
         self._inflight: dict[str, Delivery[MessagePackValue]] = {}
+        # Deliveries handed to the retry engine (in backoff, or bouncing on a
+        # full queue) are not yet in ``_inflight`` but are still unacked backlog.
+        # Counted per-subscriber so eviction can clear a dead sub's share, with a
+        # running total for an O(1) gate check.
+        self._retry_pending: dict[str, int] = {}
+        self._retry_pending_total = 0
         self._streams: dict[str, "_SubscriptionStream"] = {}
         self._log = logging.getLogger("pubsub.server.broker")
         # Admission control: gate opens while the unacked-delivery backlog is
@@ -211,9 +217,11 @@ class Broker:
         except asyncio.QueueFull:
             # Slow subscriber: hand off to the retry engine. schedule() only
             # spawns the backoff sleep as a task — this await does not block on
-            # the backoff itself.
+            # the backoff itself. The delivery is now retry-limbo backlog and
+            # counts against admission until it is re-enqueued or the sub evicted.
+            self._enter_retry(registration.subscription.subscription_id)
             await self._retry.schedule(
-                registration.queue, delivery, self._record_inflight, self._on_exhausted
+                registration.queue, delivery, self._record_retried, self._on_exhausted
             )
             return
         self._record_inflight(delivery)
@@ -235,15 +243,46 @@ class Broker:
         the in-flight publish concurrency is tolerated."""
         if self._max_inflight is None:
             return
-        while len(self._inflight) >= self._max_inflight:
+        while self._backlog() >= self._max_inflight:
             self._admit.clear()
             await self._admit.wait()
+
+    def _backlog(self) -> int:
+        """Total unacked backlog: enqueued-and-inflight plus retry-limbo. Gating
+        on the sum (not just ``_inflight``) is what keeps a flood whose deliveries
+        all spill to retry from reading as empty and defeating the gate."""
+        return len(self._inflight) + self._retry_pending_total
 
     def _refresh_admission(self) -> None:
         """Reopen the admission gate once the backlog drops below the bound.
         Sync (no await) so it is safe from retry background tasks and eviction."""
-        if self._max_inflight is None or len(self._inflight) < self._max_inflight:
+        if self._max_inflight is None or self._backlog() < self._max_inflight:
             self._admit.set()
+
+    def _enter_retry(self, subscription_id: str) -> None:
+        """Account a delivery leaving its queue for retry-limbo (backoff or a
+        full-queue bounce). Paired with ``_leave_retry`` (re-enqueued) or the
+        bulk clear in ``_drop_inflight`` (evicted/unsubscribed)."""
+        self._retry_pending[subscription_id] = (
+            self._retry_pending.get(subscription_id, 0) + 1
+        )
+        self._retry_pending_total += 1
+
+    def _leave_retry(self, subscription_id: str) -> None:
+        remaining = self._retry_pending.get(subscription_id)
+        if not remaining:
+            return  # subscriber already evicted; its count was cleared in bulk
+        if remaining == 1:
+            del self._retry_pending[subscription_id]
+        else:
+            self._retry_pending[subscription_id] = remaining - 1
+        self._retry_pending_total -= 1
+
+    def _record_retried(self, delivery: Delivery[MessagePackValue]) -> None:
+        """Retry engine re-enqueued a delivery: move it from retry-limbo to
+        inflight. Net backlog is unchanged, so the gate state does not shift."""
+        self._leave_retry(delivery.subscription_id)
+        self._record_inflight(delivery)
 
     def _record_inflight(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight[delivery.delivery_id] = delivery
@@ -256,6 +295,9 @@ class Broker:
         ]
         for delivery_id in stale:
             self._inflight.pop(delivery_id, None)
+        # Drop this sub's retry-limbo share too, else evicting a subscriber that
+        # was spilling to retry would leak backlog and wedge the gate shut.
+        self._retry_pending_total -= self._retry_pending.pop(subscription_id, 0)
         self._refresh_admission()
 
     def _disconnect(self, subscription_id: str) -> None:
@@ -277,14 +319,18 @@ class Broker:
 
     async def _nack(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight.pop(delivery.delivery_id, None)
-        self._refresh_admission()
         self._obs.on_nack(delivery.subscription_id, attempt=delivery.attempt)
         registration = self._router.get(delivery.subscription_id)
         if registration is None:
-            return  # subscription gone; nothing to redeliver to
-        # Backoff runs off-path (schedule spawns it); nack returns promptly.
+            # Subscription gone: the slot is genuinely freed, reopen the gate.
+            self._refresh_admission()
+            return
+        # Move inflight -> retry-limbo (net backlog unchanged, so the gate does
+        # not shift). Backoff runs off-path (schedule spawns it); nack returns
+        # promptly.
+        self._enter_retry(delivery.subscription_id)
         await self._retry.schedule(
-            registration.queue, delivery, self._record_inflight, self._on_exhausted
+            registration.queue, delivery, self._record_retried, self._on_exhausted
         )
 
     async def _unsubscribe(self, subscription_id: str) -> None:

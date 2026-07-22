@@ -11,7 +11,7 @@ import unittest
 
 from tests.conftest import FakeClock
 
-from pubsub.server.broker import Broker
+from pubsub.server.broker import DEFAULT_QUEUE_BOUND, Broker
 from pubsub.server.durability.memory import InMemoryDurability
 from pubsub.server.retry import RetryPolicy
 
@@ -59,6 +59,44 @@ class BackpressureTests(unittest.IsolatedAsyncioTestCase):
 
         await sub.unsubscribe()  # drops inflight -> gate reopens
         self.assertTrue((await asyncio.wait_for(third, timeout=1.0)).accepted)
+
+    async def test_retry_limbo_backlog_keeps_the_gate_closed(self) -> None:
+        # Regression (PERF_RERUN §7 accept-flood): a delivery that spills to the
+        # retry engine (queue full) is not in _inflight yet, but is still unacked
+        # backlog. If the gate ignored it, a flood whose deliveries all bounce
+        # into retry would read as empty backlog and the gate would never engage
+        # — exactly the observed 8500/s accept with ack_ratio 0.22. It must count.
+        broker = Broker(
+            InMemoryDurability(),
+            clock=FakeClock(),
+            # Huge backoff so retried deliveries park in limbo (they never
+            # exhaust and evict the sub during the test).
+            retry_policy=RetryPolicy(base=1e6, rng=lambda: 1.0, max_attempts=100),
+            max_inflight=DEFAULT_QUEUE_BOUND + 2,
+        )
+        self.addAsyncCleanup(broker.close)
+        sub = await broker.subscribe("t.*")  # never consumed → its queue fills
+
+        # Fill the queue to its bound: these all enqueue as inflight.
+        for n in range(DEFAULT_QUEUE_BOUND):
+            self.assertTrue((await broker.publish("t.x", n)).accepted)
+        # The next two overflow the queue → retry-limbo. Backlog is now
+        # bound (inflight) + 2 (limbo) = the watermark.
+        self.assertTrue((await broker.publish("t.x", "a")).accepted)
+        self.assertTrue((await broker.publish("t.x", "b")).accepted)
+
+        # At the watermark. The next publish must block on admission even though
+        # only `bound` deliveries are truly enqueued — the old leaky accounting
+        # (len(_inflight) only) would wave it straight through.
+        blocked = asyncio.ensure_future(broker.publish("t.x", "c"))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(blocked), timeout=0.05)
+
+        # Drain + ack one enqueued delivery → inflight drops below the watermark
+        # → gate reopens → the blocked publish proceeds.
+        delivery = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+        await sub.ack(delivery)
+        self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0)).accepted)
 
     async def test_max_inflight_none_never_blocks(self) -> None:
         broker = Broker(
