@@ -1,27 +1,45 @@
-"""Publisher client boundary (typed, async, in-process).
+"""Publisher convenience: bind a topic over any broker backend.
 
-CLI and network clients are future adapters that call the same contract.
+Not a competing contract. The canonical publish shape is
+``publish(topic, payload)`` on ``Broker`` (embedded) and ``BrokerClient``
+(networked). ``Publisher`` merely binds a topic so a caller that always targets
+one subject supplies just the payload; it delegates to whichever backend it
+wraps, so the same convenience works in-process or over the wire.
 """
 
-from abc import ABC, abstractmethod
 from collections.abc import Mapping
+from typing import Protocol
 
 from pubsub.shared.types import MessagePackValue, PublishResult
 
 
-class Publisher[PayloadT](ABC):
-    """Typed interface for publishing payloads to a bound topic.
+class PublishBackend(Protocol):
+    """Anything with the canonical publish shape (``Broker``, ``BrokerClient``)."""
 
-    The concrete implementation binds a topic; callers supply only the payload
-    and optional user ``extras`` metadata.
-    """
+    async def publish(
+        self,
+        topic: str,
+        payload: MessagePackValue,
+        *,
+        extras: Mapping[str, MessagePackValue] | None = None,
+    ) -> PublishResult: ...
 
-    @abstractmethod
+
+class Publisher[PayloadT: MessagePackValue]:
+    """Binds a topic to a backend; callers supply only the payload."""
+
+    def __init__(self, backend: PublishBackend, topic: str) -> None:
+        self._backend = backend
+        self._topic = topic
+
+    @property
+    def topic(self) -> str:
+        return self._topic
+
     async def publish(
         self,
         payload: PayloadT,
         *,
         extras: Mapping[str, MessagePackValue] | None = None,
     ) -> PublishResult:
-        """Wrap payload in an envelope, durably store, return broker result."""
-        ...
+        return await self._backend.publish(self._topic, payload, extras=extras)
