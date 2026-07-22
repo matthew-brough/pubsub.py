@@ -117,6 +117,23 @@ class SQLiteDurabilityTests(DurabilityContract, unittest.IsolatedAsyncioTestCase
         self.assertEqual(got.payload, payload)
         self.assertEqual(got.extras, {"trace": "id-1"})
 
+    async def test_group_commit_persists_all_concurrent_appends_in_order(self) -> None:
+        # Group commit must not drop or reorder rows: fire many appends
+        # concurrently (so they coalesce into shared transactions) and assert
+        # every one is durable, oldest-first by created_at.
+        b = await self._open()
+        await b.register_topic("a.b", replayable=True)
+        import asyncio
+
+        await asyncio.gather(
+            *(
+                b.append(make_message("a.b", n, created_at=float(n), message_id=f"m{n}"))
+                for n in range(50)
+            )
+        )
+        got = await b.read_from(0.0)
+        self.assertEqual([m.message_id for m in got], [f"m{n}" for n in range(50)])
+
     async def test_history_persists_across_reconnect(self) -> None:
         # Durability: data stored by one connection is visible after reopen,
         # even though the in-process replayable cache is empty on the new handle.
