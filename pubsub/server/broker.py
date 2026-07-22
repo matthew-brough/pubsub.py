@@ -40,14 +40,20 @@ from pubsub.shared.types import (
 # scaling formula is unspecified. Fixed bound used until that decision is made.
 DEFAULT_QUEUE_BOUND = 128
 
-# Backpressure high-watermark on the total unacked-delivery backlog. In-memory
-# durability accepts publishes with no natural pacing (unlike sqlite, whose
+# Backpressure high-watermark, expressed *per active subscriber*. In-memory /
+# null durability accept publishes with no natural pacing (unlike sqlite, whose
 # per-append fsync throttles a producer for free), so an unbraked fast producer
-# floods subscriber queues into the retry/DLQ eviction spiral. Gating new
-# publishes on this backlog paces intake to consumer drain regardless of backend.
-# DEFER: like the queue bound, a size that scales with active subscribers is the
-# eventual target; a fixed high-watermark is used until that formula is decided.
-DEFAULT_MAX_INFLIGHT = 1024
+# floods subscriber queues into the retry/DLQ eviction spiral. The effective gate
+# is this value times the live subscriber count (see ``Broker._watermark``).
+#
+# Scaling with subscribers is what a fixed total got wrong: a fixed 1024 sat 8x
+# above a single consumer's queue bound, so under a producer-heavy flood a lone
+# consumer's deliveries spilled to retry and exhausted its budget — evicting it —
+# *before* the global watermark ever engaged, after which fanout emptied and
+# accept ran away (PERF_MATRIX §3 collapse). Tied to the per-subscriber queue
+# bound, the gate instead trips as a consumer's queue fills, pacing producers to
+# drain rather than evicting.
+DEFAULT_MAX_INFLIGHT_PER_SUBSCRIBER = DEFAULT_QUEUE_BOUND
 
 
 class Broker:
@@ -58,7 +64,7 @@ class Broker:
         clock: Clock | None = None,
         retry_policy: RetryPolicy | None = None,
         observer: Observer | None = None,
-        max_inflight: int | None = DEFAULT_MAX_INFLIGHT,
+        max_inflight_per_subscriber: int | None = DEFAULT_MAX_INFLIGHT_PER_SUBSCRIBER,
     ) -> None:
         self._durability = durability
         self._clock: Clock = clock or SystemClock()
@@ -76,8 +82,9 @@ class Broker:
         self._streams: dict[str, "_SubscriptionStream"] = {}
         self._log = logging.getLogger("pubsub.server.broker")
         # Admission control: gate opens while the unacked-delivery backlog is
-        # below ``max_inflight`` (``None`` disables). Acks/evictions reopen it.
-        self._max_inflight = max_inflight
+        # below the effective watermark (``per_subscriber × live subscribers``;
+        # ``None`` disables). Acks, evictions, and subscriber joins reopen it.
+        self._max_inflight_per_sub = max_inflight_per_subscriber
         self._admit = asyncio.Event()
         self._admit.set()
 
@@ -134,6 +141,9 @@ class Broker:
         )
         registration = Registration(subscription, queue, tokens)
         self._router.register(registration)
+        # A new subscriber raises the effective watermark; release any producer
+        # already blocked on admission.
+        self._refresh_admission()
         stream = _SubscriptionStream(self, subscription, queue)
         self._streams[subscription.subscription_id] = stream
 
@@ -236,14 +246,14 @@ class Broker:
 
     async def _gate(self) -> None:
         """Admission control: block a new publish while the unacked-delivery
-        backlog is at/above ``max_inflight``. Acks and evictions lower the
+        backlog is at/above the effective watermark. Acks and evictions lower the
         backlog and reopen the gate. Waiting yields the loop, so ack/retry tasks
         keep draining — the gate always eventually reopens (dead subscribers are
         evicted, releasing their backlog). Soft bound: transient overshoot up to
         the in-flight publish concurrency is tolerated."""
-        if self._max_inflight is None:
+        if self._max_inflight_per_sub is None:
             return
-        while self._backlog() >= self._max_inflight:
+        while self._backlog() >= self._watermark():
             self._admit.clear()
             await self._admit.wait()
 
@@ -253,10 +263,20 @@ class Broker:
         all spill to retry from reading as empty and defeating the gate."""
         return len(self._inflight) + self._retry_pending_total
 
+    def _watermark(self) -> int:
+        """Effective backlog bound: the per-subscriber budget times the live
+        subscriber count, floored at one subscriber's worth so a broker with no
+        subscribers — where no delivery backlog can form — never self-blocks.
+        Recomputed on each check so it tracks subscribers joining and leaving."""
+        assert self._max_inflight_per_sub is not None
+        return self._max_inflight_per_sub * max(1, self._router.active_count())
+
     def _refresh_admission(self) -> None:
-        """Reopen the admission gate once the backlog drops below the bound.
-        Sync (no await) so it is safe from retry background tasks and eviction."""
-        if self._max_inflight is None or self._backlog() < self._max_inflight:
+        """Reopen the admission gate once the backlog drops below the watermark.
+        Sync (no await) so it is safe from retry background tasks and eviction.
+        Also called when a subscriber joins — the higher watermark can release a
+        producer already parked on the gate."""
+        if self._max_inflight_per_sub is None or self._backlog() < self._watermark():
             self._admit.set()
 
     def _enter_retry(self, subscription_id: str) -> None:

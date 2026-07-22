@@ -22,7 +22,7 @@ class BackpressureTests(unittest.IsolatedAsyncioTestCase):
             InMemoryDurability(),
             clock=FakeClock(),
             retry_policy=RetryPolicy(base=0.0, rng=lambda: 0.0),
-            max_inflight=2,
+            max_inflight_per_subscriber=2,
         )
         self.addAsyncCleanup(self.broker.close)
 
@@ -72,7 +72,7 @@ class BackpressureTests(unittest.IsolatedAsyncioTestCase):
             # Huge backoff so retried deliveries park in limbo (they never
             # exhaust and evict the sub during the test).
             retry_policy=RetryPolicy(base=1e6, rng=lambda: 1.0, max_attempts=100),
-            max_inflight=DEFAULT_QUEUE_BOUND + 2,
+            max_inflight_per_subscriber=DEFAULT_QUEUE_BOUND + 2,
         )
         self.addAsyncCleanup(broker.close)
         sub = await broker.subscribe("t.*")  # never consumed → its queue fills
@@ -103,12 +103,40 @@ class BackpressureTests(unittest.IsolatedAsyncioTestCase):
             InMemoryDurability(),
             clock=FakeClock(),
             retry_policy=RetryPolicy(base=0.0, rng=lambda: 0.0),
-            max_inflight=None,
+            max_inflight_per_subscriber=None,
         )
         self.addAsyncCleanup(broker.close)
         await broker.subscribe("t.*")
         for n in range(10):  # no acks, yet none of these block
             self.assertTrue((await broker.publish("t.x", n)).accepted)
+
+    async def test_watermark_scales_with_subscriber_count(self) -> None:
+        # The gate is per-subscriber: the effective bound is the per-subscriber
+        # budget times the live subscriber count. A producer blocked at one
+        # subscriber's watermark is released when a second subscriber joins and
+        # raises it (PERF_MATRIX §3 fix — the gate paces to drain instead of the
+        # flood evicting a lone consumer before a fixed global bound engages).
+        broker = Broker(
+            InMemoryDurability(),
+            clock=FakeClock(),
+            retry_policy=RetryPolicy(base=0.0, rng=lambda: 0.0),
+            max_inflight_per_subscriber=1,
+        )
+        self.addAsyncCleanup(broker.close)
+
+        await broker.subscribe("a.*")  # 1 subscriber → watermark 1
+        # Fills the backlog to the watermark (delivered, unacked).
+        self.assertTrue((await broker.publish("a.x", 1)).accepted)
+
+        # Second publish is over the one-subscriber watermark → blocks.
+        blocked = asyncio.ensure_future(broker.publish("a.y", 2))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(blocked), timeout=0.05)
+
+        # A second (independent) subscriber lifts the watermark to 2 → the gate
+        # reopens and the parked publish completes, no ack required.
+        await broker.subscribe("b.*")
+        self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0)).accepted)
 
 
 if __name__ == "__main__":
