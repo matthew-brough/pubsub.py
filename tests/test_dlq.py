@@ -22,7 +22,12 @@ class DLQTests(unittest.IsolatedAsyncioTestCase):
         self.broker = Broker(self.durability, clock=FakeClock(), retry_policy=policy)
         self.addAsyncCleanup(self.broker.close)
         # DLQ exhaustion logs at ERROR; silence it so test output stays clean.
-        logging.getLogger("pubsub.server.retry").setLevel(logging.CRITICAL)
+        # Restore afterwards — the logger is global, and leaving it clamped
+        # would suppress ERROR logs other test modules assert on.
+        retry_log = logging.getLogger("pubsub.server.retry")
+        prior = retry_log.level
+        retry_log.setLevel(logging.CRITICAL)
+        self.addCleanup(retry_log.setLevel, prior)
 
     async def test_exhausted_delivery_is_dead_lettered(self) -> None:
         sub = await self.broker.subscribe("t.*")

@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from pubsub.server.log import InMemoryDurableHandler, SQLiteDurableHandler
+from pubsub.shared.log import configure_logging
 
 
 def _record(name: str, level: int, msg: str, created: float) -> logging.LogRecord:
@@ -42,6 +43,36 @@ class InMemoryHandlerTests(unittest.TestCase):
         self.h.flush_to_storage()
         got = [r.getMessage() for r in self.h.retrieve(since=20.0)]
         self.assertEqual(got, ["new"])
+
+
+class ConfigureLoggingTests(unittest.TestCase):
+    """configure_logging attaches handlers to the ``pubsub`` root logger so
+    records emitted anywhere in the package reach the durable handler."""
+
+    def tearDown(self) -> None:
+        root = logging.getLogger("pubsub")
+        for handler in list(root.handlers):
+            root.removeHandler(handler)
+        root.propagate = True
+
+    def test_wires_durable_handler_and_disables_propagation(self) -> None:
+        durable = InMemoryDurableHandler()
+        configure_logging(level=logging.INFO, durable=durable)
+        root = logging.getLogger("pubsub")
+        self.assertIn(durable, root.handlers)
+        self.assertFalse(root.propagate)
+
+        logging.getLogger("pubsub.audit").error("boom")
+        durable.flush_to_storage()
+        got = [r.getMessage() for r in durable.retrieve(level=logging.ERROR)]
+        self.assertEqual(got, ["boom"])
+
+    def test_idempotent_clears_prior_handlers(self) -> None:
+        configure_logging(durable=InMemoryDurableHandler())
+        configure_logging(durable=InMemoryDurableHandler())
+        root = logging.getLogger("pubsub")
+        # One console + one durable, not doubled up across the two calls.
+        self.assertEqual(len(root.handlers), 2)
 
 
 class SQLiteHandlerTests(unittest.TestCase):

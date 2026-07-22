@@ -202,6 +202,9 @@ class Broker:
 
     def _on_exhausted(self, subscription_id: str) -> None:
         # Retry budget spent: disconnect the slow subscriber; its id survives.
+        self._log.warning(
+            "retry budget exhausted; evicting slow subscriber %s", subscription_id
+        )
         self._obs.on_retry_exhausted(subscription_id)
         self._disconnect(subscription_id)
 

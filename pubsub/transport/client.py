@@ -250,6 +250,7 @@ class BrokerClient(ClientTransport):
             for sub in list(self._subs.values()):
                 sub._close()
             return
+        self._log.warning("connection lost; reconnecting")
         if self._reconnect_task is None or self._reconnect_task.done():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
@@ -271,6 +272,7 @@ class BrokerClient(ClientTransport):
                 continue  # lost it again mid-resume; _open's read loop will retrigger
             return
         # Reconnect gave up: surface closure to consumers.
+        self._log.error("reconnect gave up after %d attempts; closing subscriptions", attempt)
         for sub in list(self._subs.values()):
             sub._close()
         self._subs.clear()

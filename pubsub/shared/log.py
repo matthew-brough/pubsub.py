@@ -99,3 +99,35 @@ def make_formatter(stream: Any = None) -> logging.Formatter:
 def get_logger(name: str) -> logging.Logger:
     """Convenience wrapper for the package logger hierarchy."""
     return logging.getLogger(name)
+
+
+def configure_logging(
+    *,
+    level: int = logging.INFO,
+    stream: Any = None,
+    durable: logging.Handler | None = None,
+) -> None:
+    """Install the package's logging handlers on the ``pubsub`` root logger.
+
+    Attaches a colour-aware ``StreamHandler`` (colour auto-detected via
+    ``make_formatter``) and, when given, a ``durable`` handler for persistence.
+    Idempotent: existing ``pubsub`` handlers are cleared first. Propagation to
+    the root logger is disabled so records are not double-emitted by a
+    ``basicConfig`` handler an application may also have installed.
+    """
+    root = logging.getLogger("pubsub")
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+    root.setLevel(level)
+
+    target = stream if stream is not None else sys.stderr
+    console = logging.StreamHandler(target)
+    console.setFormatter(make_formatter(target))
+    root.addHandler(console)
+
+    if durable is not None:
+        if durable.formatter is None:
+            durable.setFormatter(logging.Formatter(PLAIN_FORMAT, _DATEFMT))
+        root.addHandler(durable)
+
+    root.propagate = False
