@@ -41,6 +41,12 @@ type _Params = Sequence[object] | Mapping[str, object]
 
 DEFAULT_READERS = 4
 _BUSY_TIMEOUT_MS = 5000
+# WAL + NORMAL is the recommended durable/fast pairing: no corruption risk, fully
+# durable across process crash/kill, and only a power/OS crash can drop the last
+# not-yet-checkpointed transactions. FULL adds a per-commit fsync (much slower at
+# low append concurrency) for strict last-transaction durability.
+DEFAULT_SYNCHRONOUS = "NORMAL"
+_SYNCHRONOUS_MODES = ("FULL", "NORMAL")
 
 
 class _RWLock:
@@ -145,14 +151,26 @@ class AsyncSQLite:
         self._closed = False
 
     @classmethod
-    async def connect(cls, path: str, *, readers: int = DEFAULT_READERS) -> Self:
+    async def connect(
+        cls,
+        path: str,
+        *,
+        readers: int = DEFAULT_READERS,
+        synchronous: str = DEFAULT_SYNCHRONOUS,
+    ) -> Self:
         """Open a write connection plus ``readers`` read connections.
 
         ``readers=0`` degrades to single-connection mode (reads run on the write
-        connection, still gated by the read/write lock).
+        connection, still gated by the read/write lock). ``synchronous`` sets the
+        WAL durability/throughput trade (``NORMAL`` or ``FULL``).
         """
         if readers < 0:
             raise ValueError("readers must be >= 0")
+        sync_mode = synchronous.upper()
+        if sync_mode not in _SYNCHRONOUS_MODES:
+            raise ValueError(
+                f"synchronous must be one of {_SYNCHRONOUS_MODES}, got {synchronous!r}"
+            )
 
         if path == ":memory:":
             # Per-instance shared-cache name so the pool's connections share one
@@ -174,6 +192,9 @@ class AsyncSQLite:
                 # WAL is a database-level, persistent setting; the writer sets it
                 # before any reader opens. No-op ('memory') for :memory: DBs.
                 connection.execute("PRAGMA journal_mode=WAL").close()
+                # synchronous is per-connection and only governs commit fsync, so
+                # it is set on the sole writer; readers never commit.
+                connection.execute(f"PRAGMA synchronous={sync_mode}").close()
             return connection
 
         writer = await _Conn.open(lambda: _open(wal=True))

@@ -15,6 +15,7 @@ from pubsub.shared.log import configure_logging
 from pubsub.server.broker import Broker
 from pubsub.server.durability.abc import DurabilityBackend
 from pubsub.server.durability.memory import InMemoryDurability
+from pubsub.server._asqlite import DEFAULT_SYNCHRONOUS, _SYNCHRONOUS_MODES
 from pubsub.server.durability.sqlite import SQLiteDurability
 from pubsub.server.log import (
     DurableHandler,
@@ -30,9 +31,9 @@ _log = logging.getLogger("pubsub.transport.runner")
 _LOG_FLUSH_INTERVAL = 5.0
 
 
-async def _build_durability(kind: str, db_path: str) -> DurabilityBackend:
+async def _build_durability(kind: str, db_path: str, synchronous: str = DEFAULT_SYNCHRONOUS) -> DurabilityBackend:
     if kind == "sqlite":
-        return await SQLiteDurability.connect(db_path)
+        return await SQLiteDurability.connect(db_path, synchronous=synchronous)
     return InMemoryDurability()
 
 
@@ -56,19 +57,16 @@ async def serve(
     port: int = DEFAULT_PORT,
     durability: str = "memory",
     db_path: str = "pubsub.db",
+    synchronous: str = DEFAULT_SYNCHRONOUS,
     log_handler: DurableHandler | None = None,
 ) -> None:
     """Run a broker server until cancelled. Tears down broker + server on exit."""
-    backend = await _build_durability(durability, db_path)
+    backend = await _build_durability(durability, db_path, synchronous)
     broker = Broker(backend)
     server = BrokerServer(broker, host=host, port=port)
     await server.start()
-    flusher = (
-        asyncio.create_task(_flush_loop(log_handler)) if log_handler is not None else None
-    )
-    _log.info(
-        "pubsub broker serving on %s:%d (durability=%s)", host, server.port, durability
-    )
+    flusher = asyncio.create_task(_flush_loop(log_handler)) if log_handler is not None else None
+    _log.info("pubsub broker serving on %s:%d (durability=%s)", host, server.port, durability)
     try:
         await server.serve_forever()
     finally:
@@ -83,24 +81,23 @@ async def serve(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        prog="pubsub-server", description="Run a pubsub broker over TCP."
-    )
+    parser = argparse.ArgumentParser(prog="pubsub-server", description="Run a pubsub broker over TCP.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--durability", choices=("memory", "sqlite"), default="memory")
+    parser.add_argument("--db", default="pubsub.db", help="SQLite path (used when --durability sqlite)")
     parser.add_argument(
-        "--durability", choices=("memory", "sqlite"), default="memory"
-    )
-    parser.add_argument(
-        "--db", default="pubsub.db", help="SQLite path (used when --durability sqlite)"
+        "--sqlite-sync",
+        choices=_SYNCHRONOUS_MODES,
+        default=DEFAULT_SYNCHRONOUS,
+        help="SQLite WAL synchronous mode: NORMAL (fast, crash-safe) or FULL "
+        "(strict last-transaction durability). Default NORMAL.",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
     log_handler = _build_log_handler(args.durability, args.db)
-    configure_logging(
-        level=logging.DEBUG if args.verbose else logging.INFO, durable=log_handler
-    )
+    configure_logging(level=logging.DEBUG if args.verbose else logging.INFO, durable=log_handler)
     try:
         asyncio.run(
             serve(
@@ -108,6 +105,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 port=args.port,
                 durability=args.durability,
                 db_path=args.db,
+                synchronous=args.sqlite_sync,
                 log_handler=log_handler,
             )
         )

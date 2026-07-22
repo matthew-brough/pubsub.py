@@ -128,6 +128,30 @@ class AsyncSQLiteTests(unittest.IsolatedAsyncioTestCase):
         await db.execute("INSERT INTO t (v) VALUES (?)", ("solo",))
         self.assertEqual(await self._values(db), ["solo"])
 
+    async def test_synchronous_defaults_to_normal(self) -> None:
+        # WAL + NORMAL is the fast/durable default; FULL is opt-in. synchronous is
+        # per-connection and only the writer commits, so readers=0 routes the
+        # PRAGMA read to the write connection where it is set.
+        path = os.path.join(self._dir, f"{uuid.uuid4().hex}.db")
+        db = await AsyncSQLite.connect(path, readers=0)
+        self.addAsyncCleanup(db.close)
+        row = await db.fetchone("PRAGMA synchronous")
+        assert row is not None
+        self.assertEqual(row["synchronous"], 1)  # 1 = NORMAL
+
+    async def test_synchronous_full_is_opt_in(self) -> None:
+        path = os.path.join(self._dir, f"{uuid.uuid4().hex}.db")
+        db = await AsyncSQLite.connect(path, readers=0, synchronous="full")  # case-insensitive
+        self.addAsyncCleanup(db.close)
+        row = await db.fetchone("PRAGMA synchronous")
+        assert row is not None
+        self.assertEqual(row["synchronous"], 2)  # 2 = FULL
+
+    async def test_invalid_synchronous_rejected(self) -> None:
+        path = os.path.join(self._dir, f"{uuid.uuid4().hex}.db")
+        with self.assertRaises(ValueError):
+            await AsyncSQLite.connect(path, synchronous="OFF")
+
     async def test_continuous_writes_do_not_starve_reads(self) -> None:
         # Phase fairness: a relentless writer stream must not lock reads out.
         # Under the old unconditional writer preference this read never returns.

@@ -13,7 +13,11 @@ from typing import Self, cast
 
 import msgpack
 
-from pubsub.server._asqlite import DEFAULT_READERS, AsyncSQLite
+from pubsub.server._asqlite import (
+    DEFAULT_READERS,
+    DEFAULT_SYNCHRONOUS,
+    AsyncSQLite,
+)
 from pubsub.server.durability.abc import DurabilityBackend
 from pubsub.shared.types import DLQEntry, Message, MessagePackValue
 
@@ -85,8 +89,14 @@ class SQLiteDurability(DurabilityBackend):
         self._drain_task: asyncio.Task[None] | None = None
 
     @classmethod
-    async def connect(cls, path: str, *, readers: int = DEFAULT_READERS) -> Self:
-        db = await AsyncSQLite.connect(path, readers=readers)
+    async def connect(
+        cls,
+        path: str,
+        *,
+        readers: int = DEFAULT_READERS,
+        synchronous: str = DEFAULT_SYNCHRONOUS,
+    ) -> Self:
+        db = await AsyncSQLite.connect(path, readers=readers, synchronous=synchronous)
         await db.executescript(_SCHEMA)
         return cls(db)
 
