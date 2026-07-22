@@ -40,6 +40,15 @@ from pubsub.shared.types import (
 # scaling formula is unspecified. Fixed bound used until that decision is made.
 DEFAULT_QUEUE_BOUND = 128
 
+# Backpressure high-watermark on the total unacked-delivery backlog. In-memory
+# durability accepts publishes with no natural pacing (unlike sqlite, whose
+# per-append fsync throttles a producer for free), so an unbraked fast producer
+# floods subscriber queues into the retry/DLQ eviction spiral. Gating new
+# publishes on this backlog paces intake to consumer drain regardless of backend.
+# DEFER: like the queue bound, a size that scales with active subscribers is the
+# eventual target; a fixed high-watermark is used until that formula is decided.
+DEFAULT_MAX_INFLIGHT = 1024
+
 
 class Broker:
     def __init__(
@@ -49,6 +58,7 @@ class Broker:
         clock: Clock | None = None,
         retry_policy: RetryPolicy | None = None,
         observer: Observer | None = None,
+        max_inflight: int | None = DEFAULT_MAX_INFLIGHT,
     ) -> None:
         self._durability = durability
         self._clock: Clock = clock or SystemClock()
@@ -59,6 +69,11 @@ class Broker:
         self._inflight: dict[str, Delivery[MessagePackValue]] = {}
         self._streams: dict[str, "_SubscriptionStream"] = {}
         self._log = logging.getLogger("pubsub.server.broker")
+        # Admission control: gate opens while the unacked-delivery backlog is
+        # below ``max_inflight`` (``None`` disables). Acks/evictions reopen it.
+        self._max_inflight = max_inflight
+        self._admit = asyncio.Event()
+        self._admit.set()
 
     async def register_topic(self, topic: str, *, replayable: bool) -> None:
         await self._durability.register_topic(topic, replayable=replayable)
@@ -83,6 +98,9 @@ class Broker:
             extras=dict(extras or {}),
             created_at=self._clock.now(),
         )
+        # Backpressure: pace intake to the unacked backlog before taking on more
+        # durable work, so a fast producer cannot flood queues into eviction.
+        await self._gate()
         # Publish succeeds only after durable storage returns.
         await self._durability.append(message)
 
@@ -208,6 +226,25 @@ class Broker:
         self._obs.on_retry_exhausted(subscription_id)
         self._disconnect(subscription_id)
 
+    async def _gate(self) -> None:
+        """Admission control: block a new publish while the unacked-delivery
+        backlog is at/above ``max_inflight``. Acks and evictions lower the
+        backlog and reopen the gate. Waiting yields the loop, so ack/retry tasks
+        keep draining — the gate always eventually reopens (dead subscribers are
+        evicted, releasing their backlog). Soft bound: transient overshoot up to
+        the in-flight publish concurrency is tolerated."""
+        if self._max_inflight is None:
+            return
+        while len(self._inflight) >= self._max_inflight:
+            self._admit.clear()
+            await self._admit.wait()
+
+    def _refresh_admission(self) -> None:
+        """Reopen the admission gate once the backlog drops below the bound.
+        Sync (no await) so it is safe from retry background tasks and eviction."""
+        if self._max_inflight is None or len(self._inflight) < self._max_inflight:
+            self._admit.set()
+
     def _record_inflight(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight[delivery.delivery_id] = delivery
 
@@ -219,6 +256,7 @@ class Broker:
         ]
         for delivery_id in stale:
             self._inflight.pop(delivery_id, None)
+        self._refresh_admission()
 
     def _disconnect(self, subscription_id: str) -> None:
         """Tear down a subscription (slow-subscriber eviction). Sync so it is
@@ -231,6 +269,7 @@ class Broker:
 
     async def _ack(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight.pop(delivery.delivery_id, None)
+        self._refresh_admission()
         self._obs.on_ack(delivery.subscription_id)
         await self._durability.record_ack(
             delivery.subscription_id, delivery.message.message_id
@@ -238,6 +277,7 @@ class Broker:
 
     async def _nack(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight.pop(delivery.delivery_id, None)
+        self._refresh_admission()
         self._obs.on_nack(delivery.subscription_id, attempt=delivery.attempt)
         registration = self._router.get(delivery.subscription_id)
         if registration is None:
