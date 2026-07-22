@@ -12,6 +12,10 @@ dependencies = [
 # OpenTelemetry adapter (pubsub.observability.otel). API only — the app wires
 # the SDK/exporter. Core runtime stays stdlib + msgpack.
 otel = ["opentelemetry-api>=1.27.0"]
+# Faster event loop for the networked broker. Opt-in: the runner uses uvloop if
+# importable and falls back to stdlib asyncio otherwise. No Windows wheels, so
+# the core never hard-depends on it.
+fast = ["uvloop>=0.21; platform_system != 'Windows'"]
 
 [project.scripts]
 pubsub-server = "pubsub.transport.runner:main"

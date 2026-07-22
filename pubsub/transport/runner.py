@@ -8,7 +8,7 @@ broker without hand-writing the ``asyncio.run`` boilerplate.
 import argparse
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from pubsub.shared.log import configure_logging
 
@@ -46,6 +46,19 @@ def _build_log_handler(kind: str, db_path: str) -> DurableHandler:
     if kind == "sqlite":
         return SQLiteDurableHandler(db_path)
     return InMemoryDurableHandler()
+
+
+def _loop_factory() -> tuple[str, Callable[[], asyncio.AbstractEventLoop] | None]:
+    """Pick the event loop for ``asyncio.run``. uvloop if the ``fast`` extra is
+    installed (the single broker loop is the throughput wall, so a faster loop is
+    a free win), else stdlib asyncio via ``None``. Returned as a ``loop_factory``
+    rather than a global policy — the policy API is deprecated in 3.14. Fallback
+    keeps the core portable (uvloop has no Windows wheels)."""
+    try:
+        import uvloop
+    except ImportError:
+        return "asyncio", None
+    return "uvloop", uvloop.new_event_loop
 
 
 async def _flush_loop(handler: DurableHandler) -> None:
@@ -106,6 +119,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     log_handler = _build_log_handler(args.durability, args.db)
     configure_logging(level=logging.DEBUG if args.verbose else logging.INFO, durable=log_handler)
+    loop_name, loop_factory = _loop_factory()
+    _log.info("event loop: %s", loop_name)
     try:
         asyncio.run(
             serve(
@@ -115,7 +130,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 db_path=args.db,
                 synchronous=args.sqlite_sync,
                 log_handler=log_handler,
-            )
+            ),
+            loop_factory=loop_factory,
         )
     except KeyboardInterrupt:
         _log.info("shutting down")
