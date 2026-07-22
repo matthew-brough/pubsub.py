@@ -256,15 +256,26 @@ class _SubscriptionStream(Subscriber[MessagePackValue]):
         self._queue = queue
         self._closed = asyncio.Event()
 
+    @property
+    def subscription_id(self) -> str:
+        return self._subscription.subscription_id
+
     async def __anext__(self) -> Delivery[MessagePackValue]:
         if self._closed.is_set() and self._queue.empty():
             raise StopAsyncIteration
 
         get_task = asyncio.ensure_future(self._queue.get())
         closed_task = asyncio.ensure_future(self._closed.wait())
-        done, pending = await asyncio.wait(
-            {get_task, closed_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        try:
+            done, pending = await asyncio.wait(
+                {get_task, closed_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            # Consumer/pump cancelled mid-wait: cancel the helper tasks so a
+            # pending ``queue.get()`` does not leak as a destroyed-pending task.
+            get_task.cancel()
+            closed_task.cancel()
+            raise
         # Prefer a ready delivery over the close signal so nothing is dropped.
         if get_task in done:
             closed_task.cancel()

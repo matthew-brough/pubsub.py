@@ -13,6 +13,12 @@ from pubsub.shared.types import Delivery
 class Subscriber[PayloadT](ABC):
     """Async stream of deliveries plus acknowledgement controls."""
 
+    @property
+    @abstractmethod
+    def subscription_id(self) -> str:
+        """Broker-created id for this subscription; stable across reconnect."""
+        ...
+
     def __aiter__(self) -> AsyncIterator[Delivery[PayloadT]]:
         return self
 
