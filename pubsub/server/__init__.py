@@ -5,6 +5,7 @@ from pubsub.server.broker import Broker
 from pubsub.server.durability import (
     DurabilityBackend,
     InMemoryDurability,
+    NullDurability,
     SQLiteDurability,
 )
 from pubsub.server.log import (
@@ -20,6 +21,7 @@ __all__ = [
     "Observer",
     "DurabilityBackend",
     "InMemoryDurability",
+    "NullDurability",
     "SQLiteDurability",
     "DurableHandler",
     "InMemoryDurableHandler",

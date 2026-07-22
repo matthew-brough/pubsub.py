@@ -15,6 +15,7 @@ from pubsub.shared.log import configure_logging
 from pubsub.server.broker import Broker
 from pubsub.server.durability.abc import DurabilityBackend
 from pubsub.server.durability.memory import InMemoryDurability
+from pubsub.server.durability.null import NullDurability
 from pubsub.server._asqlite import DEFAULT_SYNCHRONOUS, _SYNCHRONOUS_MODES
 from pubsub.server.durability.sqlite import SQLiteDurability
 from pubsub.server.log import (
@@ -34,6 +35,8 @@ _LOG_FLUSH_INTERVAL = 5.0
 async def _build_durability(kind: str, db_path: str, synchronous: str = DEFAULT_SYNCHRONOUS) -> DurabilityBackend:
     if kind == "sqlite":
         return await SQLiteDurability.connect(db_path, synchronous=synchronous)
+    if kind in ("none", "null", "off"):
+        return NullDurability()
     return InMemoryDurability()
 
 
@@ -84,7 +87,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="pubsub-server", description="Run a pubsub broker over TCP.")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--durability", choices=("memory", "sqlite"), default="memory")
+    parser.add_argument(
+        "--durability",
+        choices=("memory", "sqlite", "none"),
+        default="memory",
+        help="none = accept-and-drop (at-most-once, no replay, no history growth)",
+    )
     parser.add_argument("--db", default="pubsub.db", help="SQLite path (used when --durability sqlite)")
     parser.add_argument(
         "--sqlite-sync",
