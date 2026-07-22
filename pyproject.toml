@@ -1,9 +1,19 @@
 [project]
 name = "pubsub-py"
 version = "0.1.0"
-description = "Add your description here"
+description = "A small, strongly-typed async network pub/sub library and broker."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "msgpack>=1.2.1",
 ]
+
+[project.scripts]
+pubsub-server = "pubsub.transport.runner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pubsub"]
