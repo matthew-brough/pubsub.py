@@ -14,7 +14,6 @@ Deferred / not fully specified by the notes, marked here rather than invented:
 
 import asyncio
 import logging
-import uuid
 from collections.abc import Mapping
 
 from pubsub.client.subscriber import Subscriber
@@ -24,6 +23,7 @@ from pubsub.server.retry import RetryEngine, RetryPolicy
 from pubsub.server.router import Registration, Router
 from pubsub.shared import topic as _topic
 from pubsub.shared.clock import Clock, SystemClock
+from pubsub.shared.ids import new_id
 from pubsub.shared.types import (
     Delivery,
     FromUnixTimestamp,
@@ -105,7 +105,7 @@ class Broker:
             return PublishResult.rejected(PublishError("invalid_topic", str(exc)))
 
         message: Message[MessagePackValue] = Message(
-            message_id=uuid.uuid4().hex,
+            message_id=new_id(),
             topic=topic,
             payload=payload,
             extras=dict(extras or {}),
@@ -132,7 +132,7 @@ class Broker:
         tokens = _topic.validate_pattern(selector)  # raises TopicError on bad pattern
         policy: ReplayPolicy = replay_policy or FutureOnly()
         subscription = Subscription(
-            subscription_id=uuid.uuid4().hex,
+            subscription_id=new_id(),
             selector=selector,
             replay_policy=policy,
         )
@@ -187,7 +187,7 @@ class Broker:
         self, registration: Registration, message: Message[MessagePackValue]
     ) -> Delivery[MessagePackValue]:
         return Delivery(
-            delivery_id=uuid.uuid4().hex,
+            delivery_id=new_id(),
             subscription_id=registration.subscription.subscription_id,
             message=message,
             attempt=1,
@@ -201,7 +201,7 @@ class Broker:
         attempt: int,
     ) -> None:
         delivery = Delivery(
-            delivery_id=uuid.uuid4().hex,
+            delivery_id=new_id(),
             subscription_id=registration.subscription.subscription_id,
             message=message,
             attempt=attempt,

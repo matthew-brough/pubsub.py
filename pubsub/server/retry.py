@@ -9,11 +9,11 @@ separate so its bounds and cap can be tested without any async machinery.
 import asyncio
 import logging
 import random
-import uuid
 from collections.abc import Callable
 
 from pubsub.server.durability.abc import DurabilityBackend
 from pubsub.shared.clock import Clock
+from pubsub.shared.ids import new_id
 from pubsub.shared.types import DLQEntry, Delivery, MessagePackValue
 
 _log = logging.getLogger("pubsub.server.retry")
@@ -130,7 +130,7 @@ class RetryEngine:
         """
         await asyncio.sleep(self._policy.backoff(next_attempt))
         retry = Delivery(
-            delivery_id=uuid.uuid4().hex,
+            delivery_id=new_id(),
             subscription_id=delivery.subscription_id,
             message=delivery.message,
             attempt=next_attempt,
