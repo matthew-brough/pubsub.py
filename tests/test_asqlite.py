@@ -128,6 +128,27 @@ class AsyncSQLiteTests(unittest.IsolatedAsyncioTestCase):
         await db.execute("INSERT INTO t (v) VALUES (?)", ("solo",))
         self.assertEqual(await self._values(db), ["solo"])
 
+    async def test_continuous_writes_do_not_starve_reads(self) -> None:
+        # Phase fairness: a relentless writer stream must not lock reads out.
+        # Under the old unconditional writer preference this read never returns.
+        db = await self._db(readers=2)
+        stop = asyncio.Event()
+
+        async def write_forever() -> None:
+            while not stop.is_set():
+                await db.execute("INSERT INTO t (v) VALUES (?)", ("x",))
+
+        writer = asyncio.ensure_future(write_forever())
+        try:
+            await asyncio.sleep(0.02)  # let the write stream saturate the lock
+            rows = await asyncio.wait_for(
+                db.fetchall("SELECT COUNT(*) AS n FROM t"), timeout=1.0
+            )
+            self.assertGreaterEqual(rows[0]["n"], 0)
+        finally:
+            stop.set()
+            await writer
+
 
 if __name__ == "__main__":
     unittest.main()

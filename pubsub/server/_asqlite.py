@@ -44,36 +44,56 @@ _BUSY_TIMEOUT_MS = 5000
 
 
 class _RWLock:
-    """Writer-preferring async read/write lock.
+    """Phase-fair async read/write lock (writer-preferring, reader-starvation-free).
 
-    Many readers may hold it concurrently; a writer holds it exclusively. While
-    a writer is active or waiting, new readers block — this is what enforces
-    "writes finish before reads begin".
+    Many readers may hold it concurrently; a writer holds it exclusively. While a
+    writer is active or waiting, new readers block — this enforces "writes finish
+    before reads begin". To keep a *continuous* writer stream (e.g. group-commit
+    publish batches) from starving reads (replay/ack) forever, a completed write
+    grants the readers already waiting at its release one turn ahead of the next
+    writer. Reads issued after a write still observe it, so read-your-writes holds.
     """
 
     def __init__(self) -> None:
         self._readers = 0
         self._writer_active = False
         self._waiting_writers = 0
+        self._waiting_readers = 0
+        # Set when a write releases with readers queued: those readers run before
+        # the next writer. Cleared once the reader phase drains.
+        self._reader_turn = False
         self._cond = asyncio.Condition()
 
     async def acquire_read(self) -> None:
         async with self._cond:
-            while self._writer_active or self._waiting_writers > 0:
-                await self._cond.wait()
+            self._waiting_readers += 1
+            try:
+                # Yield to writers unless it is the readers' granted turn.
+                while self._writer_active or (
+                    self._waiting_writers > 0 and not self._reader_turn
+                ):
+                    await self._cond.wait()
+            finally:
+                self._waiting_readers -= 1
             self._readers += 1
 
     async def release_read(self) -> None:
         async with self._cond:
             self._readers -= 1
             if self._readers == 0:
+                self._reader_turn = False  # reader phase over; writers may run
                 self._cond.notify_all()
 
     async def acquire_write(self) -> None:
         async with self._cond:
             self._waiting_writers += 1
             try:
-                while self._writer_active or self._readers > 0:
+                # Stand down during a granted reader turn so the phase completes.
+                while (
+                    self._writer_active
+                    or self._readers > 0
+                    or (self._reader_turn and self._waiting_readers > 0)
+                ):
                     await self._cond.wait()
             finally:
                 self._waiting_writers -= 1
@@ -82,6 +102,9 @@ class _RWLock:
     async def release_write(self) -> None:
         async with self._cond:
             self._writer_active = False
+            # Hand the next turn to readers already waiting, so back-to-back
+            # writes cannot lock them out indefinitely.
+            self._reader_turn = self._waiting_readers > 0
             self._cond.notify_all()
 
 
