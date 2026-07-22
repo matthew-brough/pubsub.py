@@ -35,7 +35,7 @@ from pubsub.shared.types import (
     TopicConfig,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Convenience: ``await pubsub.connect(host, port)`` -> a connected BrokerClient.
 connect = BrokerClient.connect
