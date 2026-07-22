@@ -18,6 +18,7 @@ import uuid
 from collections.abc import Mapping
 
 from pubsub.client.subscriber import Subscriber
+from pubsub.observability import Observer
 from pubsub.server.durability.abc import DurabilityBackend
 from pubsub.server.retry import RetryEngine, RetryPolicy
 from pubsub.server.router import Registration, Router
@@ -47,12 +48,14 @@ class Broker:
         *,
         clock: Clock | None = None,
         retry_policy: RetryPolicy | None = None,
+        observer: Observer | None = None,
     ) -> None:
         self._durability = durability
         self._clock: Clock = clock or SystemClock()
         self._router = Router()
         self._policy = retry_policy or RetryPolicy()
         self._retry = RetryEngine(durability, self._policy, self._clock)
+        self._obs = observer or Observer()
         self._inflight: dict[str, Delivery[MessagePackValue]] = {}
         self._streams: dict[str, "_SubscriptionStream"] = {}
         self._log = logging.getLogger("pubsub.server.broker")
@@ -70,6 +73,7 @@ class Broker:
         try:
             _topic.validate_subject(topic)
         except _topic.TopicError as exc:
+            self._obs.on_publish(topic, accepted=False, reason="invalid_topic")
             return PublishResult.rejected(PublishError("invalid_topic", str(exc)))
 
         message: Message[MessagePackValue] = Message(
@@ -88,6 +92,7 @@ class Broker:
         for registration in list(self._router.match(topic)):
             await self._deliver(registration, message, attempt=1)
 
+        self._obs.on_publish(topic, accepted=True)
         return PublishResult.ok(message.message_id)
 
     async def subscribe(
@@ -178,6 +183,11 @@ class Broker:
         registration: Registration,
         delivery: Delivery[MessagePackValue],
     ) -> None:
+        self._obs.on_deliver(
+            delivery.message.topic,
+            delivery.subscription_id,
+            attempt=delivery.attempt,
+        )
         try:
             registration.queue.put_nowait(delivery)
         except asyncio.QueueFull:
@@ -192,6 +202,7 @@ class Broker:
 
     def _on_exhausted(self, subscription_id: str) -> None:
         # Retry budget spent: disconnect the slow subscriber; its id survives.
+        self._obs.on_retry_exhausted(subscription_id)
         self._disconnect(subscription_id)
 
     def _record_inflight(self, delivery: Delivery[MessagePackValue]) -> None:
@@ -217,12 +228,14 @@ class Broker:
 
     async def _ack(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight.pop(delivery.delivery_id, None)
+        self._obs.on_ack(delivery.subscription_id)
         await self._durability.record_ack(
             delivery.subscription_id, delivery.message.message_id
         )
 
     async def _nack(self, delivery: Delivery[MessagePackValue]) -> None:
         self._inflight.pop(delivery.delivery_id, None)
+        self._obs.on_nack(delivery.subscription_id, attempt=delivery.attempt)
         registration = self._router.get(delivery.subscription_id)
         if registration is None:
             return  # subscription gone; nothing to redeliver to

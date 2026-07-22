@@ -1,5 +1,6 @@
 """Server boundary: broker engine, routing, retry, durability, durable logging."""
 
+from pubsub.observability import Observer
 from pubsub.server.broker import Broker
 from pubsub.server.durability import (
     DurabilityBackend,
@@ -16,6 +17,7 @@ from pubsub.server.router import Registration, Router
 
 __all__ = [
     "Broker",
+    "Observer",
     "DurabilityBackend",
     "InMemoryDurability",
     "SQLiteDurability",

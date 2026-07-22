@@ -7,6 +7,7 @@ use. Deeper internals (router, retry, ``_asqlite``) stay in their subpackages.
 """
 
 from pubsub.client import Publisher, Subscriber
+from pubsub.observability import Observer
 from pubsub.server import Broker
 from pubsub.server.durability import (
     DurabilityBackend,
@@ -43,6 +44,7 @@ __all__ = [
     "__version__",
     "connect",
     "Broker",
+    "Observer",
     "BrokerServer",
     "BrokerClient",
     "ClientTransport",
