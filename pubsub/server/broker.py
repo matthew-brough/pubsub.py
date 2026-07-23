@@ -117,11 +117,27 @@ class Broker:
         # Publish succeeds only after durable storage returns.
         await self._durability.append(message)
 
-        # Fanout is non-blocking: enqueue per subscriber, hand slow ones to the
-        # retry engine (which defers the backoff sleep to a background task). A
-        # saturated subscriber never stalls the others or the publisher.
+        # Fanout is non-blocking: the common path (observe + put_nowait + record)
+        # is fully synchronous, so a wide fanout mints no per-delivery coroutine.
+        # Saturated subscribers spill to a tail that hands them to the retry
+        # engine off the match loop, so eviction can't mutate it mid-iteration.
+        spills: list[tuple[Registration, Delivery[MessagePackValue]]] = []
         for registration in list(self._router.match(topic)):
-            await self._deliver(registration, message, attempt=1)
+            delivery = Delivery(
+                delivery_id=new_id(),
+                subscription_id=registration.subscription.subscription_id,
+                message=message,
+                attempt=1,
+            )
+            if registration.replaying:
+                registration.buffer.append(delivery)
+            elif not self._try_enqueue(registration, delivery):
+                spills.append((registration, delivery))
+        for registration, delivery in spills:
+            self._enter_retry(registration.subscription.subscription_id)
+            await self._retry.schedule(
+                registration.queue, delivery, self._record_retried, self._on_exhausted
+            )
 
         self._obs.on_publish(topic, accepted=True)
         return PublishResult.ok(message.message_id)
@@ -193,24 +209,24 @@ class Broker:
             attempt=1,
         )
 
-    async def _deliver(
+    def _try_enqueue(
         self,
         registration: Registration,
-        message: Message[MessagePackValue],
-        *,
-        attempt: int,
-    ) -> None:
-        delivery = Delivery(
-            delivery_id=new_id(),
-            subscription_id=registration.subscription.subscription_id,
-            message=message,
-            attempt=attempt,
+        delivery: Delivery[MessagePackValue],
+    ) -> bool:
+        """Synchronous live-fanout enqueue. Returns False when the subscriber
+        queue is full so the caller spills the delivery to the retry engine."""
+        self._obs.on_deliver(
+            delivery.message.topic,
+            delivery.subscription_id,
+            attempt=delivery.attempt,
         )
-        if registration.replaying:
-            # Stage live events until history has drained (age-order handoff).
-            registration.buffer.append(delivery)
-            return
-        await self._enqueue(registration, delivery)
+        try:
+            registration.queue.put_nowait(delivery)
+        except asyncio.QueueFull:
+            return False
+        self._record_inflight(delivery)
+        return True
 
     async def _enqueue(
         self,
