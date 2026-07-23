@@ -324,6 +324,7 @@ class Broker:
         """Tear down a subscription (slow-subscriber eviction). Sync so it is
         safe to call from a retry background task with no interleaving await."""
         self._router.unregister(subscription_id)
+        self._retry.cancel_for(subscription_id)
         self._drop_inflight(subscription_id)
         stream = self._streams.pop(subscription_id, None)
         if stream is not None:
@@ -356,7 +357,8 @@ class Broker:
     async def _unsubscribe(self, subscription_id: str) -> None:
         self._router.unregister(subscription_id)
         self._streams.pop(subscription_id, None)
-        # Hard unsubscribe: pending acks dropped immediately.
+        # Hard unsubscribe: pending acks and backoff redeliveries dropped now.
+        self._retry.cancel_for(subscription_id)
         self._drop_inflight(subscription_id)
 
     async def close(self) -> None:

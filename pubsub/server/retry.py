@@ -84,6 +84,9 @@ class RetryEngine:
         self._policy = policy
         self._clock = clock
         self._tasks: set[asyncio.Task[None]] = set()
+        # Backoff tasks indexed by subscription so eviction can cancel a dead
+        # subscriber's pending redeliveries in bulk (see ``cancel_for``).
+        self._by_sub: dict[str, set[asyncio.Task[None]]] = {}
 
     async def schedule(
         self,
@@ -108,11 +111,30 @@ class RetryEngine:
                 on_exhausted(delivery.subscription_id)
             return
 
+        sid = delivery.subscription_id
         task = asyncio.ensure_future(
             self._delayed(queue, delivery, record, on_exhausted, next_attempt)
         )
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._by_sub.setdefault(sid, set()).add(task)
+
+        def _done(t: asyncio.Task[None]) -> None:
+            self._tasks.discard(t)
+            bucket = self._by_sub.get(sid)
+            if bucket is not None:
+                bucket.discard(t)
+                if not bucket:
+                    del self._by_sub[sid]
+
+        task.add_done_callback(_done)
+
+    def cancel_for(self, subscription_id: str) -> None:
+        """Cancel pending backoff redeliveries for an evicted subscription.
+        Cancellation lands at the ``asyncio.sleep`` in ``_delayed`` — the only
+        await, before any re-enqueue or in-flight record — so the delivery is
+        dropped with no half-state and no resurrected backlog."""
+        for task in list(self._by_sub.get(subscription_id, ())):
+            task.cancel()
 
     async def _delayed(
         self,

@@ -138,6 +138,37 @@ class BackpressureTests(unittest.IsolatedAsyncioTestCase):
         await broker.subscribe("b.*")
         self.assertTrue((await asyncio.wait_for(blocked, timeout=1.0)).accepted)
 
+    async def test_eviction_cancels_pending_backoff_no_backlog_leak(self) -> None:
+        # A delivery parked in retry-limbo must be cancelled when its sub is
+        # dropped. If the backoff task instead wakes after the drop it re-adds an
+        # inflight row for a dead subscription — unremovable backlog that leaks
+        # and can wedge the admission gate. It must also not spill to the DLQ.
+        durability = InMemoryDurability()
+        broker = Broker(
+            durability,
+            clock=FakeClock(),
+            # ~20ms backoff: long enough to unsubscribe before the task wakes,
+            # short enough that the sleep below outlasts it (a leaked wake fires).
+            retry_policy=RetryPolicy(base=0.02, cap_exponent=0, rng=lambda: 1.0, max_attempts=100),
+            max_inflight_per_subscriber=DEFAULT_QUEUE_BOUND,
+        )
+        self.addAsyncCleanup(broker.close)
+
+        sub = await broker.subscribe("t.*")
+        self.assertTrue((await broker.publish("t.x", 1)).accepted)
+        delivery = await asyncio.wait_for(sub.__anext__(), timeout=1.0)
+        await sub.nack(delivery)  # inflight -> retry-limbo, task now in backoff
+        self.assertEqual(broker._backlog(), 1)
+        self.assertIn(sub.subscription_id, broker._retry._by_sub)
+
+        await sub.unsubscribe()  # cancel_for + drop -> terminal
+        await asyncio.sleep(0.05)  # past when the backoff would have re-fired
+
+        self.assertEqual(broker._backlog(), 0)
+        self.assertEqual(len(broker._inflight), 0)
+        self.assertNotIn(sub.subscription_id, broker._retry._by_sub)
+        self.assertEqual(await durability.read_dlq(), [])
+
 
 if __name__ == "__main__":
     unittest.main()
